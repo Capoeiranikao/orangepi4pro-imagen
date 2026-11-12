@@ -1,0 +1,183 @@
+name: Build Armbian Orange Pi 4 Pro (Mysterium + Storj)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Distribución (trixie = Debian 13, noble = Ubuntu 24.04)"
+        required: true
+        default: "trixie"
+        type: choice
+        options:
+          - trixie
+          - noble
+      desktop:
+        description: "Incluir escritorio gráfico (xfce). Para nodos se recomienda NO."
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Liberar espacio en disco
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: true
+
+      - name: Descargar Armbian build
+        uses: actions/checkout@v4
+        with:
+          repository: armbian/build
+          ref: main
+          fetch-depth: 1
+          path: build
+
+      - name: Preparar archivos para Mysterium y Storj
+        working-directory: build
+        run: |
+          mkdir -p userpatches/overlay
+
+          cat > userpatches/overlay/mysterium-compose.yml <<'EOF'
+          services:
+            myst:
+              image: mysteriumnetwork/myst:latest
+              container_name: myst
+              restart: unless-stopped
+              network_mode: host
+              cap_add:
+                - NET_ADMIN
+              devices:
+                - /dev/net/tun:/dev/net/tun
+              volumes:
+                - /opt/nodos/mysterium/datos:/var/lib/mysterium-node
+              command: service --agreed-terms-and-conditions
+          EOF
+
+          cat > userpatches/overlay/storj-compose.yml <<'EOF'
+          services:
+            storagenode:
+              image: storjlabs/storagenode:latest
+              container_name: storagenode
+              restart: unless-stopped
+              stop_grace_period: 300s
+              ports:
+                - "28967:28967/tcp"
+                - "28967:28967/udp"
+                - "14002:14002"
+              environment:
+                WALLET: "0xCAMBIA_ESTO_POR_TU_WALLET"
+                EMAIL: "cambia@tucorreo.com"
+                ADDRESS: "cambia-esto.duckdns.org:28967"
+                STORAGE: "500GB"
+              volumes:
+                - /mnt/storj/identity:/app/identity
+                - /mnt/storj/datos:/app/config
+          EOF
+
+          cat > userpatches/overlay/daemon.json <<'EOF'
+          {
+            "log-driver": "json-file",
+            "log-opts": { "max-size": "10m", "max-file": "3" }
+          }
+          EOF
+
+          cat > userpatches/overlay/LEEME-NODOS.md <<'EOF'
+          # Nodos Mysterium y Storj en la Orange Pi 4 Pro
+
+          Docker ya viene instalado. Los archivos de cada nodo estan en:
+            /opt/nodos/mysterium/docker-compose.yml
+            /opt/nodos/storj/docker-compose.yml
+
+          ## Mysterium
+          1. Si ya tenias un nodo, copia su carpeta de datos (la identidad/keystore)
+             a /opt/nodos/mysterium/datos ANTES de arrancar. Si no, perderas la
+             identidad del nodo anterior y sus ganancias pendientes.
+             (En el sistema viejo suele estar en /var/lib/mysterium-node o en el
+             volumen de Docker que uses.)
+          2. cd /opt/nodos/mysterium && docker compose up -d
+          3. Panel en http://IP-DE-LA-PLACA:4449
+
+          ## Storj
+          Necesitas: un disco grande montado en /mnt/storj (minimo recomendado
+          por Storj: 550 GB; NO uses la eMMC de 64 GB), un wallet, tu correo,
+          un nombre DDNS (tu IP es dinamica) y el puerto 28967 TCP+UDP abierto
+          en el router hacia la placa.
+          1. Crea la identidad con el programa "identity" de Storj (se puede
+             generar en otro computador y copiar). Debe quedar en /mnt/storj/identity.
+          2. mkdir -p /mnt/storj/datos
+          3. Preparacion (una sola vez):
+             docker run --rm -e SETUP="true" \
+               --mount type=bind,source=/mnt/storj/identity,destination=/app/identity \
+               --mount type=bind,source=/mnt/storj/datos,destination=/app/config \
+               storjlabs/storagenode:latest
+          4. Edita /opt/nodos/storj/docker-compose.yml (wallet, correo, direccion DDNS, tamano).
+          5. cd /opt/nodos/storj && docker compose up -d
+          6. Panel en http://IP-DE-LA-PLACA:14002
+          EOF
+
+          cat > userpatches/customize-image.sh <<'EOF'
+          #!/bin/bash
+          # Se ejecuta dentro de la imagen al construirla.
+          RELEASE=$1
+          LINUXFAMILY=$2
+          BOARD=$3
+          BUILD_DESKTOP=$4
+
+          mkdir -p /opt/nodos/mysterium/datos /opt/nodos/storj /mnt/storj /etc/docker
+          cp /tmp/overlay/mysterium-compose.yml /opt/nodos/mysterium/docker-compose.yml
+          cp /tmp/overlay/storj-compose.yml /opt/nodos/storj/docker-compose.yml
+          cp /tmp/overlay/LEEME-NODOS.md /opt/nodos/LEEME.md
+          cp /tmp/overlay/daemon.json /etc/docker/daemon.json
+          printf 'tun\noverlay\nbr_netfilter\n' > /etc/modules-load.d/nodos.conf
+          EOF
+          chmod +x userpatches/customize-image.sh
+
+      - name: Compilar imagen
+        working-directory: build
+        run: |
+          if [ "${{ inputs.desktop }}" = "true" ]; then
+            DESKTOP="BUILD_DESKTOP=yes DESKTOP_ENVIRONMENT=xfce DESKTOP_ENVIRONMENT_CONFIG_NAME=config_base DESKTOP_APPGROUPS_SELECTED=none"
+            MINIMAL="BUILD_MINIMAL=no"
+          else
+            DESKTOP="BUILD_DESKTOP=no"
+            MINIMAL="BUILD_MINIMAL=yes"
+          fi
+          ./compile.sh build \
+            BOARD=orangepi4pro \
+            BRANCH=vendor \
+            RELEASE=${{ inputs.release }} \
+            $MINIMAL $DESKTOP \
+            KERNEL_CONFIGURE=no \
+            ENABLE_EXTENSIONS=docker-ce \
+            PACKAGE_LIST_ADDITIONAL="curl wget unzip nano htop smartmontools parted ntfs-3g exfat-fuse avahi-daemon" \
+            COMPRESS_OUTPUTIMAGE=sha,xz \
+            EXPERT=yes
+
+      - name: Subir imagen
+        uses: actions/upload-artifact@v4
+        with:
+          name: armbian-orangepi4pro-${{ inputs.release }}
+          path: |
+            build/output/images/*.img.xz
+            build/output/images/*.sha
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Subir registros si falla
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-de-error
+          path: build/output/logs/
+          retention-days: 7
+          if-no-files-found: ignore
