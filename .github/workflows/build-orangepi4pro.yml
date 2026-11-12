@@ -33,6 +33,17 @@ jobs:
           docker-images: false
           swap-storage: true
 
+      - name: Registrar emulador ARM en el servidor
+        uses: docker/setup-qemu-action@v3
+        with:
+          image: tonistiigi/binfmt:latest
+          platforms: arm64,arm
+
+      - name: Verificar que el emulador funciona
+        run: |
+          ls /proc/sys/fs/binfmt_misc/
+          docker run --rm --platform linux/arm64 debian:trixie-slim uname -m
+
       - name: Descargar Armbian build
         uses: actions/checkout@v4
         with:
